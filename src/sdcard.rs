@@ -49,7 +49,7 @@ fn sdio_init() {
 
 #[derive(Debug, Copy, Clone)]
 pub struct Card {
-    pub capacity: u32,
+    pub capacity: u64,
     block_size: u32,
     rca: u16,
 }
@@ -97,9 +97,9 @@ impl Card {
         let csd = read_response(ResponseType::LongResponse)?;
 
         // get card_capacity
-        let temp1 = (csd.1[1] & 0xFFFF0000) >> 16;
-        let temp2 = (csd.1[2] & 0x3F) << 16;
-        let card_capacity = ((temp2 | temp1) + 1) * 512 * 1024;
+        let temp1: u64 = ((csd.1[1] & 0xFFFF0000) >> 16).into();
+        let temp2: u64 = ((csd.1[2] & 0x3F) << 16).into();
+        let card_capacity: u64 = ((temp2 | temp1) + 1) * 512 * 1024;
 
         select_card((rca as u32) << 16)?;
         enable_wide_bus((rca as u32) << 16)?;
@@ -211,16 +211,16 @@ impl Card {
         Ok(())
     }
 
-    pub fn erase(&self, start_address: u32, end_address: u32) -> Result<(), CmdError> {
+    pub fn erase(&self, start_address: u64, end_address: u64) -> Result<(), CmdError> {
         wait_card_programming(self.rca)?;
         set_block_size(self.block_size)?;
 
         // send cmd 32 to set start block address, argument block address, short response
-        cmd_send(32, start_address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(32, (start_address / (self.block_size as u64)) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // send cmd 33 to set end block address, argument block address, short response
-        cmd_send(33, end_address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(33, (end_address / (self.block_size as u64)) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // send cmd 38 to start erase, argument block address, short response
