@@ -52,6 +52,7 @@ pub struct Card {
     pub capacity: u64,
     block_size: u32,
     rca: u16,
+    hid: u64,
 }
 
 impl Card {
@@ -61,20 +62,23 @@ impl Card {
         sdio_dma::init();
 
         // send cmd0 into IDLE STAGE mode , no argument, no response
+        // cmd0: カードをリセットしてアイドル状態にする。引数なし、レスポンスなし
         cmd_send(0, 0, ResponseType::NoResponse);
 
         // send cmd8 to check card type, argument 0x000001AA, short response
+        // cmd8: acmd41を送るために必要, 引数 0x1AA=1(voltage 2.7-3.6),1010_1010(recommend pattern)
         cmd_send(8, 0x000001AA, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // wait card has power to ready
         for i in 0..0xFF {
             // send acmd 41 to check sdcard ready state, argument 0x80100000 | 0x40000000, short response
+            //  0x40000000(bit30=1)はSDHCであることを示す。bit20=1は3.2-3.3Vに対応を示す。bit31(reserved)=1は?
             acmd_send(41, 0, 0x80100000 | 0x40000000, ResponseType::ShortResponse)?;
             let resp = read_response(ResponseType::ShortResponse)?;
 
             // check voltage
-            if resp.1[0] >> 31 == 1 {
+            if resp.1[0] >> 31 == 1 {   // パワーアップ処理中は0, 準備ができたら1がセットされる
                 break;
             }
 
@@ -84,21 +88,25 @@ impl Card {
         }
 
         // send cmd 2 to get CID, no argument, long response
+        // CMD2: CIDを取得、ここでは無視
         cmd_send(2, 0, ResponseType::LongResponse);
         let _drop = read_response(ResponseType::LongResponse)?;
 
         // send cmd 3 to get RCA, no argument, short response
+        // CMD3: RCAを取得。RCAは16ビットでカードアドレスを示し、以後はこのアドレスでカードを識別する
         cmd_send(3, 0, ResponseType::ShortResponse);
         let rca = read_response(ResponseType::ShortResponse)?;
         let rca = (rca.1[0] >> 16) as u16;
 
         // send cmd 9 to get CSD, argument RCA, long response
+        // CMD9: CSDを取得
         cmd_send(9, (rca as u32) << 16, ResponseType::LongResponse);
         let csd = read_response(ResponseType::LongResponse)?;
 
-        // get card_capacity
+        // get card_capacity (C_SIZE: device size bit[69:48])
         let temp1: u64 = ((csd.1[1] & 0xFFFF0000) >> 16).into();
         let temp2: u64 = ((csd.1[2] & 0x3F) << 16).into();
+        // capacity = (C_SIZE + 1) * 512KB
         let card_capacity: u64 = ((temp2 | temp1) + 1) * 512 * 1024;
 
         select_card((rca as u32) << 16)?;
@@ -109,7 +117,8 @@ impl Card {
             capacity: card_capacity,
             block_size: 512,
             rca,
-        })
+            hid: 2048 * 512,  // アドレスに履かせる下駄: BPB_HiddSec * BPB_BytsPerSec
+        })                    // BPB_HiddSecはfdiskコマンドで表示されるstart値として判明する
     }
 
     /// read block
@@ -121,7 +130,7 @@ impl Card {
         data_control(self.block_size, self.block_size, Operation::Read);
 
         // send cmd 17 to read block data, argument block address, short response
-        cmd_send(17, address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(17, ((self.hid + (address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         while !sdio_dma::stream3_transfer_complete() {}
@@ -144,7 +153,7 @@ impl Card {
         data_control(self.block_size * number_of_blocks, self.block_size, Operation::Read);
 
         // send cmd 18 to read multi blocks data, argument block address, short response
-        cmd_send(18, address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(18, ((self.hid + (address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         while !sdio_dma::stream3_transfer_complete() {}
@@ -167,7 +176,7 @@ impl Card {
         sdio_dma::memory_to_peripheral(buf);
 
         // send cmd 24 to write block, argument block address, short response
-        cmd_send(24, address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(24, ((self.hid + (address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
         data_control(self.block_size, self.block_size, Operation::Write);
 
@@ -194,7 +203,7 @@ impl Card {
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // send cmd 25 to write multi blocks, argument block address, short response
-        cmd_send(25, address / self.block_size, ResponseType::ShortResponse);
+        cmd_send(25, ((self.hid + (address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         data_control(self.block_size * number_of_blocks, self.block_size, Operation::Write);
@@ -216,11 +225,11 @@ impl Card {
         set_block_size(self.block_size)?;
 
         // send cmd 32 to set start block address, argument block address, short response
-        cmd_send(32, (start_address / (self.block_size as u64)) as u32, ResponseType::ShortResponse);
+        cmd_send(32, ((self.hid + (start_address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // send cmd 33 to set end block address, argument block address, short response
-        cmd_send(33, (end_address / (self.block_size as u64)) as u32, ResponseType::ShortResponse);
+        cmd_send(33, ((self.hid + (end_address as u64)) / self.block_size as u64) as u32, ResponseType::ShortResponse);
         let _drop = read_response(ResponseType::ShortResponse)?;
 
         // send cmd 38 to start erase, argument block address, short response
@@ -335,38 +344,40 @@ pub fn acmd_send(acmd: u8, cmd_arg: u32, acmd_arg: u32, response_type: ResponseT
     Ok(())
 }
 
-/// switch to work clock (24Mhz)
+/// クロックを24Mhzにスイッチ
 fn switch_work_clock() {
     let ptr = unsafe {
         &*stm32::SDIO::ptr()
     };
 
-    ptr.clkcr.modify(|_r, w| w.clken().clear_bit());
+    ptr.clkcr.modify(|_r, w| w.clken().clear_bit());  // クロックを無効にし
 
-    // 24Mhz = 48Mhz / (2 + 0)
-    ptr.clkcr.modify(|_r, w| unsafe {
-        w.clkdiv().bits(0).clken().set_bit()
+    // 24Mhz = 48Mhz / (2 + 0)                        // クロックを分周して24MHzに
+    ptr.clkcr.modify(|_r, w| unsafe {                 // sdio_clk = SDIOCLK/(CLKDIV + 2)
+        w.clkdiv().bits(0).clken().set_bit()          // クロックを有効に
     })
 }
 
 /// send cmd 7 to select card, argument RCA, short response
+/// RCAを指定して、カードを選択
 fn select_card(rca: u32) -> Result<(), CmdError> {
     cmd_send(7, rca, ResponseType::ShortResponse);
     let _drop = read_response(ResponseType::ShortResponse)?;
     Ok(())
 }
 
-/// enable wide bus to work
+/// ワイドバス(D0-D3を使用)を有効にする
 fn enable_wide_bus(rca: u32) -> Result<(), CmdError> {
     let ptr = unsafe {
         &*stm32::SDIO::ptr()
     };
-
-    ptr.clkcr.modify(|_r, w| w.clken().clear_bit());
-    ptr.clkcr.modify(|_r, w| unsafe {
-        w.widbus().bits(1).clken().set_bit()
+    // STM32F4側の設定
+    ptr.clkcr.modify(|_r, w| w.clken().clear_bit());  // クロックを無効に
+    ptr.clkcr.modify(|_r, w| unsafe {                 // 4ワイドバスモードに
+        w.widbus().bits(1).clken().set_bit()          // クロックを有効に
     });
-
+    // SDHCカード側の設定
+    // arg=2: 4bit bus (D0-D3を使用)
     acmd_send(6, rca, 2, ResponseType::ShortResponse)?;
     let _drop = read_response(ResponseType::ShortResponse)?;
 
